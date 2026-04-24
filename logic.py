@@ -58,7 +58,7 @@ else:
 
 # 強制指向 .exe 旁邊的 session 檔案
 session_name = os.path.join(base_path, 'bot_session') 
-tg_client = TelegramClient('bot_session', TG_API_ID, TG_API_HASH)
+tg_client = TelegramClient(session_name, TG_API_ID, TG_API_HASH)
 
 album_cache = {}  
 album_tasks = {}  
