@@ -1,4 +1,4 @@
-# ImageBOT - 跨平台自動化圖文管家
+# ImageBOT
 
 一個基於 Python 的跨平台自動化系統，透過 API 串接與非同步處理 (Async Programming)，實現 Telegram 到 Discord 的媒體同步與分類流程。本系統具備智慧標籤解析、自動化媒體壓縮以及雲端物件儲存整合能力，專為處理高併發與大容量媒體分發而設計。
 
