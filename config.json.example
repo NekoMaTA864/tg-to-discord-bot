@@ -1,0 +1,22 @@
+{
+  "discord_target": {
+    "default_channel": "其他"
+  },
+  "localization": {
+    "replacements": {
+      "视频": "影片",
+      "质量": "品質",
+      "账号": "帳號"
+    }
+  },
+  "routing": {
+    "artist_mapping": {
+      "範例繪師A": ["artist_a", "artista"],
+      "範例繪師B": ["artist_b"]
+    },
+    "series_mapping": {
+      "範例遊戲A": ["game_a", "game_alias_a"],
+      "範例動畫B": ["anime_b"]
+    }
+  }
+}

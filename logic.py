@@ -1,257 +1,374 @@
-# logic.py
-import discord, time
-import sys, re, os, asyncio
+import os
+import sys
+import time
+import json
+import asyncio
+import uuid
+import tempfile
+import shutil
+import re
+import urllib.parse
+import hashlib
+
+import discord
+import boto3
+from botocore.exceptions import ClientError
+from boto3.s3.transfer import TransferConfig
 from telethon import TelegramClient, events
 from opencc import OpenCC
 from dotenv import load_dotenv
 
-# 載入 .env 檔案裡面的環境變數
+# 載入環境變數
 load_dotenv()
 
-# --- 基礎配置 (從session.env讀取) ---
-# 注意：API_ID 和 SERVER_ID 需要用 int() 轉換成整數
+# --- 讀取 JSON 設定檔 ---
+def load_config():
+    config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.json')
+    with open(config_path, 'r', encoding='utf-8') as f:
+        return json.load(f)
+
+config_data = load_config()
+
+# 建立動態映射表 (反轉字典以利快速查詢)
+SERIES_MAPPING = {
+    alias.lower(): real_name 
+    for real_name, aliases in config_data["routing"]["series_mapping"].items() 
+    for alias in aliases
+}
+ARTIST_MAPPING = {
+    tag.lower(): channel 
+    for channel, tags in config_data["routing"]["artist_mapping"].items() 
+    for tag in tags
+}
+WORD_REPLACEMENTS = config_data["localization"]["replacements"]
+
+# --- 基礎配置參數 ---
+DISCORD_MAX_FILE_MB = int(os.getenv("DISCORD_MAX_FILE_MB", "0"))
+RECOMMEND_COMPRESS_MB = int(os.getenv("RECOMMEND_COMPRESS_MB", "80"))
+RECOMMEND_COMPRESS_DURATION_SEC = int(os.getenv("RECOMMEND_COMPRESS_DURATION_SEC", "300"))
+FFMPEG_PATH = os.getenv("FFMPEG_PATH", "ffmpeg")
+FFPROBE_PATH = os.getenv("FFPROBE_PATH", "ffprobe")
+
+# R2 相關設定
+R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID")
+R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID")
+R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY")
+R2_BUCKET_NAME = os.getenv("R2_BUCKET_NAME")
+R2_PUBLIC_URL = os.getenv("R2_PUBLIC_URL")
+
+# Telegram & Discord 憑證
 TG_API_ID = int(os.getenv('TG_API_ID', 0))
 TG_API_HASH = os.getenv('TG_API_HASH')
 TG_SOURCE_CHANNEL = os.getenv('TG_SOURCE_CHANNEL')
-
-# 如果 TG_SOURCE_CHANNEL 是一串數字的 ID (例如 -100123456789)，也需要轉整數
-if TG_SOURCE_CHANNEL.lstrip('-').isdigit():
+if TG_SOURCE_CHANNEL and TG_SOURCE_CHANNEL.lstrip('-').isdigit():
     TG_SOURCE_CHANNEL = int(TG_SOURCE_CHANNEL)
 
 DISCORD_BOT_TOKEN = os.getenv('DISCORD_BOT_TOKEN')
 DISCORD_SERVER_ID = int(os.getenv('DISCORD_SERVER_ID', 0))
 
-# 1. 在地化字詞修正表 (可隨時擴充)
-WORD_REPLACEMENTS = {
-    "视频": "影片", "质量": "品質", "账号": "帳號",
-    "绝区零": "絕區零", "崩坏": "崩壞", "星穹铁道": "星穹鐵道"
-}
+# --- 全域狀態與客戶端 ---
+cc = OpenCC('s2twp')
+discord_client = discord.Client(intents=discord.Intents.default())
+discord_client.intents.message_content = True
 
-# 2. 作品別名映射 (標籤 -> Discord 頻道名稱)
-RAW_SERIES_DATA = {
-    "妮姬": ["nikke", "victorygoddess", "勝利女神"],
-    "zzz": ["zzz", "zenlesszonezero", "絕區零"],
-    "鐵道": ["Honkai_StarRail", "スターレイル", "星穹铁道", "星穹鐵道"],
-    "檔案": ["bluearchive", "ba", "蔚藍檔案", "碧藍檔案", "ブルーアーカイブ"],
-    "符合舟禮": ["arknight", "明日方舟"],
-    "大奶航線": ["碧蓝航线", "アズールレーン"],
-    "大鳴王朝": ["WutheringWaves", "鸣潮"],
-    "原批": ["GenshinImpact", "原神"],
-}
-# 自動生成扁平化映射表，並將 key 轉為小寫以利比對
-SERIES_MAPPING = {alias.lower(): real_name for real_name, aliases in RAW_SERIES_DATA.items() for alias in aliases}
+session_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'bot_session')
+tg_client = TelegramClient(session_path, TG_API_ID, TG_API_HASH)
 
-# --- 全域記憶體 ---
+album_cache = {}
+album_tasks = {}
+banned_albums = set()
+logger = print  # 預設輸出，啟動時會被 UI callback 替換
+
 last_captured_text = ""
 last_text_time = 0
 
-# --- 全域工具與變數 ---
-cc = OpenCC('s2twp') 
-discord_client = discord.Client(intents=discord.Intents.default())
+# --- 工具函式 ---
 
-if getattr(sys, 'frozen', False):
-    # 如果是打包後的 .exe
-    base_path = os.path.dirname(sys.executable)
-else:
-    # 如果是平常在 VS Code 執行
-    base_path = os.path.dirname(os.path.abspath(__file__))
-
-# 強制指向 .exe 旁邊的 session 檔案
-session_name = os.path.join(base_path, 'bot_session') 
-tg_client = TelegramClient(session_name, TG_API_ID, TG_API_HASH)
-
-album_cache = {}  
-album_tasks = {}  
-log_func = print  
-last_msg = None   # 儲存最後一個發出的 Discord 訊息物件
-
-def localize(text):
-    """將文字簡轉繁並根據 WORD_REPLACEMENTS 修正慣用語"""
-    if not text: return ""
+def localize(text: str) -> str:
+    """文字繁體化與特定詞彙替換"""
+    if not text:
+        return ""
     converted = cc.convert(text)
-    for s, t in WORD_REPLACEMENTS.items():
-        converted = converted.replace(s, t)
+    for src, tgt in WORD_REPLACEMENTS.items():
+        converted = converted.replace(src, tgt)
     return converted
 
-def prog_cb(current, total):
-    """回報下載進度給 UI"""
-    if current == total:
-        log_func(f"  └─ 📥 媒體下載完成 (100%)")
+def is_advertisement(text: str) -> bool:
+    """過濾無標籤之廣告訊息"""
+    if not text:
+        return False
+    has_target = any(re.search(rf"{tag}.*?[:：]\s*(.*)", text, re.IGNORECASE) 
+                     for tag in ["Character", "Artist", "Material"])
+    return not has_target
 
-async def process_and_send(raw_text, file_paths):
-    """處理 Telegram 訊息並發送到 Discord 的核心函數"""
-    global last_msg, last_captured_text, last_text_time
+def infer_server_limit(guild) -> int:
+    """推斷 Discord 伺服器上傳限制 (Bytes)"""
+    if DISCORD_MAX_FILE_MB > 0:
+        return DISCORD_MAX_FILE_MB * 1024 * 1024
+    tier = getattr(guild, "premium_tier", 0)
+    mapping_mb = {0: 8, 1: 50, 2: 100, 3: 250}
+    return mapping_mb.get(tier, 25) * 1024 * 1024
+
+async def get_media_duration(path: str):
+    """取得媒體時長"""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            FFPROBE_PATH, "-v", "error", "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1", path,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+        stdout, _ = await proc.communicate()
+        return float(stdout.decode().strip()) if stdout else None
+    except Exception:
+        return None
+
+async def compress_with_ffmpeg_async(input_path: str, output_path: str, target_size_bytes: int) -> bool:
+    """非同步壓縮影片，優先使用 AMD 硬體加速 (h264_amf)，失敗則退回 CPU 編碼"""
+    duration = await get_media_duration(input_path)
+    if not duration:
+        return False
+
+    target_total_bitrate = (target_size_bytes * 8) / duration
+    target_video_bitrate = max(100, (target_total_bitrate / 1000) - 128)
+
+    cmd_amd = [
+        'ffmpeg', '-y', '-i', input_path,
+        '-c:v', 'h264_amf', '-b:v', f'{int(target_video_bitrate)}k',
+        '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart', output_path
+    ]
+
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *cmd_amd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+        _, stderr = await process.communicate()
+
+        if process.returncode == 0:
+            return True
+
+        logger(f"[系統] AMD 加速編碼失敗，切換至 CPU 模式。")
+        
+        cmd_cpu = [
+            'ffmpeg', '-y', '-i', input_path,
+            '-c:v', 'libx264', '-preset', 'ultrafast',
+            '-b:v', f'{int(target_video_bitrate)}k',
+            '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart', output_path
+        ]
+        process_cpu = await asyncio.create_subprocess_exec(
+            *cmd_cpu, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+        await process_cpu.communicate()
+        return process_cpu.returncode == 0
+
+    except Exception as e:
+        logger(f"[錯誤] FFmpeg 執行異常: {e}")
+        return False
+
+async def upload_to_r2(path: str) -> str:
+    """上傳大型檔案至 Cloudflare R2 並回傳直連 URL"""
+    if not all([R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET_NAME, R2_PUBLIC_URL]):
+        logger("[警告] 缺少 R2 設定，放棄上傳")
+        return None
+
+    original_ext = os.path.splitext(path)[1] or ".mp4"
+    short_hash = hashlib.md5(str(time.time()).encode()).hexdigest()[:8]
+    filename = f"v_{short_hash}{original_ext}"
+
+    def _sync_upload():
+        try:
+            endpoint = f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+            s3 = boto3.client(
+                "s3", endpoint_url=endpoint, aws_access_key_id=R2_ACCESS_KEY_ID,
+                aws_secret_access_key=R2_SECRET_ACCESS_KEY
+            )
+            config = TransferConfig(
+                multipart_threshold=8 * 1024 * 1024, max_concurrency=10,
+                multipart_chunksize=8 * 1024 * 1024, use_threads=True
+            )
+            s3.upload_file(path, R2_BUCKET_NAME, filename, Config=config)
+            
+            clean_url = R2_PUBLIC_URL.replace("https://", "").replace("http://", "").rstrip('/')
+            return f"https://{clean_url}/{urllib.parse.quote(filename)}"
+        except Exception as e:
+            logger(f"[錯誤] R2 上傳失敗 {path}: {e}")
+            return None
+
+    return await asyncio.to_thread(_sync_upload)
+
+# --- 核心處理與路由 ---
+
+async def process_and_send(raw_text: str, file_paths: list):
+    """解析標籤、分配頻道、處理檔案並發送至 Discord"""
+    global last_captured_text, last_text_time
+
     guild = discord_client.get_guild(DISCORD_SERVER_ID)
-    if not guild: return
+    if not guild:
+        logger("[錯誤] 找不到目標 Discord 伺服器。")
+        return
 
+    # 文字記憶機制
     current_time = time.time()
-
-    # 1. 記憶體邏輯：處理大量上傳時「沒文字」的圖片
     if raw_text.strip():
-        last_captured_text = raw_text
-        last_text_time = current_time
-    elif (current_time - last_text_time) < 30: # 大量上傳建議放寬到 15 秒
+        last_captured_text, last_text_time = raw_text, current_time
+    elif (current_time - last_text_time) < 30:
         raw_text = last_captured_text
 
-    # 2. 解析標籤內容
-    char_m = re.search(r"Character.*?[:：]\s*(.*)", raw_text, re.IGNORECASE)
-    art_m = re.search(r"Artist.*?[:：]\s*(.*)", raw_text, re.IGNORECASE)
-    mat_m = re.search(r"Material.*?[:：]\s*(.*)", raw_text, re.IGNORECASE)
-
-    c_tag = localize(char_m.group(1).strip() if char_m else "")
-    a_tag = localize(art_m.group(1).strip() if art_m else "")
-    m_tag = localize(mat_m.group(1).strip() if mat_m else "")
-
-    # 2. 頻道分流邏輯
+    # 標籤解析與路由判定
+    all_hashtags = [tag.lower() for tag in re.findall(r'#([^\s#]+)', raw_text)]
     target_channel = None
-    # 優先找繪師 (#Artist 內容)
-    a_hashes = re.findall(r'#(\w+)', a_tag)
-    for t in a_hashes:
-        target_channel = discord.utils.get(guild.text_channels, name=t.lower())
-        if target_channel: break
-    
-    # 次要找作品 (別名映射)
-    if not target_channel:
-        m_hashes = re.findall(r'#(\w+)', m_tag)
-        for t in m_hashes:
-            dest = SERIES_MAPPING.get(t.lower(), t.lower())
-            target_channel = discord.utils.get(guild.text_channels, name=dest)
-            if target_channel: break
 
-    # C. 防呆：找不到就進「其他」
+    for tag in all_hashtags:
+        dest = ARTIST_MAPPING.get(tag)
+        if dest:
+            target_channel = discord.utils.get(guild.text_channels, name=dest)
+            break
+
     if not target_channel:
-        target_channel = discord.utils.get(guild.text_channels, name="其他")
+        for tag in all_hashtags:
+            dest = SERIES_MAPPING.get(tag)
+            if dest:
+                target_channel = discord.utils.get(guild.text_channels, name=dest)
+                break
+
+    if not target_channel:
+        target_channel = discord.utils.get(guild.text_channels, name=config_data["discord_target"]["default_channel"])
 
     if target_channel:
-        log_func(f"🔍 [解析] 頻道目標: #{target_channel.name}")
+        logger(f"[分發] 鎖定目標頻道: #{target_channel.name}")
+
+        # 格式化輸出文字
+        extracted = {
+            "char": re.search(r"Character.*?[:：]\s*(.*)", raw_text, re.IGNORECASE),
+            "art": re.search(r"Artist.*?[:：]\s*(.*)", raw_text, re.IGNORECASE),
+            "mat": re.search(r"Material.*?[:：]\s*(.*)", raw_text, re.IGNORECASE)
+        }
+        lines = [localize(m.group(1).strip()) for m in extracted.values() if m]
+        custom_text = f"```\n{chr(10).join(lines)}\n```" if lines else ""
+
+    server_limit = infer_server_limit(guild)
+    safe_limit = max(8 * 1024 * 1024, server_limit - (2 * 1024 * 1024))
+    recommend_bytes = RECOMMEND_COMPRESS_MB * 1024 * 1024
+
+    ready_files, oversize_files, external_links, temp_to_delete = [], [], [], []
+
+    # 檔案體積篩選
+    for p in file_paths:
+        if not os.path.exists(p): continue
+        size = os.path.getsize(p)
+        (ready_files if size <= safe_limit else oversize_files).append(p if size <= safe_limit else (p, size))
+
+    # 大檔處理 (壓縮或上傳)
+    for src_path, size in oversize_files:
+        base_name = os.path.basename(src_path)
+        duration = await get_media_duration(src_path) or 999999
         
-        # 3. 組合發送文字 (使用 Markdown 程式碼區塊)
-        final_list = [t for t in [c_tag, a_tag, m_tag] if t]
-        inner = "\n".join(final_list) if final_list else localize(raw_text).strip()
-        custom_text = f"```\n{inner}\n```"
+        if size <= recommend_bytes and duration <= RECOMMEND_COMPRESS_DURATION_SEC:
+            tmp_dst = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4().hex}.mp4")
+            logger(f"[處理] 正在壓縮: {base_name}")
+            ok = await compress_with_ffmpeg_async(src_path, tmp_dst, safe_limit)
+            
+            if ok and os.path.exists(tmp_dst) and os.path.getsize(tmp_dst) <= safe_limit:
+                ready_files.append(tmp_dst)
+                temp_to_delete.append(tmp_dst)
+            else:
+                logger(f"[處理] 壓縮未達標，轉交 R2 上傳: {base_name}")
+                link = await upload_to_r2(src_path)
+                if link: external_links.append(link)
+        else:
+            link = await upload_to_r2(src_path)
+            if link: external_links.append(link)
 
-        # 4. 準備檔案並檢查大小 (Discord 免費版限制約 25MB)
-        ready_files = []
-        over_info = ""
-        for p in file_paths:
-            if os.path.exists(p):
-                size = os.path.getsize(p) / (1024*1024)
-                if size <= 25:
-                    ready_files.append(discord.File(p))
+    # 發送邏輯
+    try:
+        if ready_files:
+            batches, current_batch, current_size = [], [], 0
+            for fp in ready_files:
+                size = os.path.getsize(fp)
+                if (current_size + size > safe_limit) or (len(current_batch) >= 10):
+                    batches.append(current_batch)
+                    current_batch, current_size = [fp], size
                 else:
-                    over_info += f"\n⚠️ 檔案過大已保留本地: {os.path.basename(p)} ({size:.1f}MB)"
+                    current_batch.append(fp)
+                    current_size += size
+            if current_batch: batches.append(current_batch)
 
-        # 5. 發送至 Discord 並記住該訊息
-        try:
-            # 如果連文字都沒有且沒檔案，就不發送
-            if not ready_files and not custom_text:
-                return
+            for i, batch_paths in enumerate(batches):
+                files = [discord.File(fp) for fp in batch_paths if os.path.exists(fp)]
+                await target_channel.send(content=custom_text if i == 0 else "", files=files)
+        elif custom_text and not external_links:
+            await target_channel.send(content=custom_text)
 
-            # 使用 range 迴圈，每次跳 10 個檔案
-            for i in range(0, len(ready_files), 10):
-                batch = ready_files[i:i+10]
-                
-                # 只有發送第一批時會帶文字標籤與大檔案警告
-                # 如果是第 21 張圖，custom_text 會變為空字串，才不會重複洗版
-                content_to_send = (custom_text + over_info) if i == 0 else ""
-                
-                last_msg = await target_channel.send(content=content_to_send, files=batch)
-                
-                # 如果有很多組，可以噴個進度
-                if len(ready_files) > 10:
-                    log_func(f"📦 [批次] 已送達第 {i//10 + 1} 組媒體...")
+        if external_links:
+            await target_channel.send(content="\n".join(external_links))
 
-            log_func(f"✨ [完成] 全數訊息已送達 Discord")
+        logger(f"[完成] 任務執行完畢。")
 
-            # --- 第三階段：全部發完後，安全刪除 ---
-            await asyncio.sleep(2)
-            for p in file_paths:
-                try:
-                    if os.path.exists(p): os.remove(p)
-                except: pass
+        # 清理
+        await asyncio.sleep(1)
+        for p in file_paths + temp_to_delete:
+            if os.path.exists(p): os.remove(p)
 
-        except Exception as e:
-            log_func(f"💥 [錯誤] Discord 發送失敗: {e}")
+    except Exception as e:
+        logger(f"[錯誤] Discord 發送失敗: {e}")
 
-async def edit_last_logic(new_text):
-    """執行 Discord 上的編輯動作"""
-    global last_msg
-    if last_msg:
-        try:
-            # 加上 ``` 使格式整齊
-            await last_msg.edit(content=f"```\n{new_text}\n```")
-            return True
-        except Exception as e:
-            return f"編輯失敗: {e}"
-    return "找不到最後一則訊息紀錄"
+# --- 服務啟動入口 ---
 
-def run_logic(ui_callback):
-    """由 main.py 呼叫的啟動進入點"""
-    global log_func
-    log_func = ui_callback
+def run_logic(ui_callback, running_event):
+    global logger
+    logger = ui_callback
     os.makedirs("images", exist_ok=True)
     os.makedirs("videos", exist_ok=True)
 
     @tg_client.on(events.NewMessage(chats=TG_SOURCE_CHANNEL))
     async def handler(event):
-        if event.message.media:
-            gid = event.message.grouped_id
-            log_func(f"🔔 [偵測] 收到媒體訊息 (ID: {event.message.id})")
-            save_path = "images/" if event.message.photo else "videos/"
-            path = await event.message.download_media(file=save_path, progress_callback=prog_cb)
-            
-            if gid: # 相簿處理邏輯 (等待 5 秒收齊)
-                if gid not in album_cache: album_cache[gid] = {"text": "", "files": []}
-                if event.message.text: album_cache[gid]["text"] = event.message.text
-                album_cache[gid]["files"].append(path)
-                if gid in album_tasks: album_tasks[gid].cancel()
-                async def delayed(g_id):
-                    await asyncio.sleep(5)
-                    if g_id in album_cache:
-                        data = album_cache.pop(g_id)
-                        await process_and_send(data["text"], data["files"])
-                album_tasks[gid] = asyncio.create_task(delayed(gid))
-            else: # 單一媒體處理
-                await process_and_send(event.message.text or "", [path])
+        global banned_albums
+        if not event.message.media: return
+
+        gid = event.message.grouped_id
+        text = event.message.text
+
+        if gid and (gid in banned_albums): return
+        if text and is_advertisement(text):
+            logger("[攔截] 偵測到無效標籤或廣告。")
+            if gid: banned_albums.add(gid)
+            return
+
+        if gid:
+            if gid not in album_cache:
+                album_cache[gid] = {"text": text or "", "messages": []}
+            elif text:
+                album_cache[gid]["text"] = text
+            album_cache[gid]["messages"].append(event.message)
+
+            if gid in album_tasks: album_tasks[gid].cancel()
+
+            async def delayed_process(g_id):
+                await asyncio.sleep(5)
+                if g_id in album_cache:
+                    data = album_cache.pop(g_id)
+                    logger(f"[下載] 開始擷取相簿媒體 (共 {len(data['messages'])} 件)...")
+                    
+                    file_paths = []
+                    for msg in data["messages"]:
+                        folder = "images/" if msg.photo else "videos/"
+                        p = await msg.download_media(file=folder)
+                        if p: file_paths.append(p)
+                    await process_and_send(data["text"], file_paths)
+
+            album_tasks[gid] = asyncio.create_task(delayed_process(gid))
+        else:
+            folder = "images/" if event.message.photo else "videos/"
+            path = await event.message.download_media(file=folder)
+            if path: await process_and_send(text or "", [path])
 
     @discord_client.event
     async def on_ready():
-        log_func(f"✅ Discord 機器人已上線: {discord_client.user}")
+        logger(f"[系統] Discord 機器人連線成功: {discord_client.user}")
         try:
-            log_func("📡 正在嘗試連線至 Telegram...")
             await tg_client.start()
-        
-            # 🌟 核心修正：手動讓 TG 認識這個頻道 (手動刷入快取)
-            # 這樣下方的監聽器就不會報 ValueError 了
-            try:
-                await tg_client.get_entity(TG_SOURCE_CHANNEL)
-                log_func(f"📢 已成功識別目標頻道 ID: {TG_SOURCE_CHANNEL}")
-            except Exception as e:
-                log_func(f"⚠️ 無法識別頻道，請確認帳號是否在頻道內: {e}")
-
-            log_func("📡 Telegram 監聽系統已成功啟動！")
+            await tg_client.get_entity(TG_SOURCE_CHANNEL)
+            logger("[系統] Telegram 監聽服務啟動。")
         except Exception as e:
-            log_func(f"❌ TG 啟動失敗: {e}")
+            logger(f"[錯誤] Telegram 啟動失敗: {e}")
 
-    log_func("🔄 正在啟動系統核心...")
     discord_client.run(DISCORD_BOT_TOKEN)
-
-def run_edit(text, callback):
-    """
-    🌟 重要修正：修正最後一則訊息的進入點
-    解決 Timeout context manager 報錯：必須使用 run_coroutine_threadsafe 
-    將任務丟回 Discord 正在運行的 Loop 中執行。
-    """
-    try:
-        # 將 edit 任務安全地丟進 Discord 正在跑的小宇宙
-        future = asyncio.run_coroutine_threadsafe(edit_last_logic(text), discord_client.loop)
-        
-        # 等待結果 (最長等待 10 秒)
-        result = future.result(timeout=10) 
-        
-        if result is True:
-            callback("📝 [系統] 訊息修正成功！")
-        else:
-            callback(f"⚠️ [警告] {result}")
-    except Exception as e:
-        callback(f"💥 [錯誤] 執行修正時發生異常: {e}")
